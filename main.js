@@ -1,4 +1,9 @@
 const { Plugin, PluginSettingTab, Setting } = require('obsidian');
+const { ViewPlugin, Decoration, WidgetType } = require('@codemirror/view');
+
+// ============================================================
+//  常量 & 默认设置
+// ============================================================
 
 const STYLE_OPTIONS = {
   '1': '阿拉伯数字 (1, 2, 3...)',
@@ -13,111 +18,443 @@ const STYLE_OPTIONS = {
 const DEFAULT_SETTINGS = {
   startLevel: 1,
   depth: 8,
-  removeExisting: true,
-  // 是否在次级标题前添加首级序号（例如：在次级前显示 "一、1" 而非仅显示 "1"）
   prependParentNumber: true,
-  // 是否在标题改变时自动重新生成序号
-  autoGenerateOnChange: false,
-  // 为每一级存储配置：[{ style: '1', displayFormat: '{}', separator: '.' }, ...]
-  // 默认不设分隔符（允许为空字符串），可在设置中自定义为 '.'、'、' 等
+  showInEditMode: true,
+  showInReadingMode: true,
+  showInOutline: true,
+  numberSeparator: ' ',
   levelConfigs: [
-    { style: '1', displayFormat: '{}', separator: '' },
-    { style: 'a', displayFormat: '{}', separator: '' },
-    { style: 'i', displayFormat: '{}', separator: '' },
-    { style: 'A', displayFormat: '{}', separator: '' },
+    { style: '1', displayFormat: '{}', separator: '.' },
+    { style: 'a', displayFormat: '{}', separator: '.' },
+    { style: 'i', displayFormat: '{}', separator: '.' },
+    { style: 'A', displayFormat: '{}', separator: '.' },
     { style: 'I', displayFormat: '{}', separator: '' },
     { style: '一', displayFormat: '{}', separator: '' },
     { style: '1', displayFormat: '{}', separator: '' },
-    { style: 'a', displayFormat: '{}', separator: '' }
-  ]
+    { style: 'a', displayFormat: '{}', separator: '' },
+  ],
 };
+
+// ============================================================
+//  数字格式化工具
+// ============================================================
+
+function formatNumber(num, style) {
+  if (num <= 0) return '';
+  switch (style) {
+    case '1': return String(num);
+    case 'a': return toLetters(num, false);
+    case 'A': return toLetters(num, true);
+    case 'i': return toRoman(num).toLowerCase();
+    case 'I': return toRoman(num);
+    case '一': return toChineseUpper(num);
+    case '①': return toCircledNumber(num);
+    default: return String(num);
+  }
+}
+
+function toLetters(num, isUpperCase = false) {
+  if (num <= 0) return '';
+  if (num > 18278) return String(num);
+  const base = isUpperCase ? 65 : 97;
+  let result = '';
+  let n = num;
+  while (n > 0) {
+    n--;
+    result = String.fromCharCode(base + (n % 26)) + result;
+    n = Math.floor(n / 26);
+  }
+  return result;
+}
+
+function toRoman(num) {
+  const matrix = [
+    [1000, 'M'], [900, 'CM'], [500, 'D'], [400, 'CD'],
+    [100, 'C'], [90, 'XC'], [50, 'L'], [40, 'XL'],
+    [10, 'X'], [9, 'IX'], [5, 'V'], [4, 'IV'], [1, 'I'],
+  ];
+  let roman = '';
+  for (const [val, sym] of matrix) {
+    while (num >= val) { roman += sym; num -= val; }
+  }
+  return roman;
+}
+
+function toChineseUpper(num) {
+  if (num <= 0 || num > 999) return String(num);
+  const digits = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
+  const units = ['', '十', '百', '千'];
+  if (num < 10) return digits[num];
+  if (num < 20) {
+    if (num === 10) return '十';
+    return '十' + digits[num % 10];
+  }
+  let result = '';
+  const str = String(num).split('').map(Number);
+  for (let i = 0; i < str.length; i++) {
+    const d = str[i];
+    const unitIdx = str.length - 1 - i;
+    if (d === 0) {
+      if (result && !result.endsWith('零')) result += '零';
+    } else {
+      result += digits[d];
+      if (unitIdx > 0) result += units[unitIdx];
+    }
+  }
+  return result.replace(/零+$/, '').replace(/零+/g, '零');
+}
+
+function toCircledNumber(num) {
+  const arr = [
+    '①','②','③','④','⑤','⑥','⑦','⑧','⑨','⑩',
+    '⑪','⑫','⑬','⑭','⑮','⑯','⑰','⑱','⑲','⑳',
+  ];
+  if (num >= 1 && num <= 20) return arr[num - 1];
+  return String(num);
+}
+
+function applyDisplayFormat(number, displayFormat) {
+  if (!displayFormat || displayFormat === '{}') return number;
+  return displayFormat.replace('{}', number);
+}
+
+// ============================================================
+//  核心序号计算（纯函数）
+//  输入： headings = [{ level, text, line }, ...]
+//  输出： Map<line, numberString>
+// ============================================================
+
+function computeNumbering(headings, settings) {
+  const result = new Map();
+  const counters = new Array(9).fill(0);
+  const { startLevel, depth, prependParentNumber, levelConfigs } = settings;
+
+  for (const h of headings) {
+    const level = h.level;
+    if (level < startLevel || level >= startLevel + depth) continue;
+    for (let j = level + 1; j <= 8; j++) counters[j] = 0;
+    counters[level]++;
+
+    let numbering = '';
+    const endLevel = Math.min(level, startLevel + depth - 1);
+    let firstSegment = startLevel;
+    if (!prependParentNumber && level > startLevel) {
+      firstSegment = startLevel + 1;
+    }
+
+    for (let cur = firstSegment; cur <= endLevel; cur++) {
+      const ci = cur - startLevel;
+      const cfg = levelConfigs[ci] || { style: '1', displayFormat: '{}', separator: '' };
+      const counter = counters[cur] || 0;
+      const formatted = formatNumber(counter, cfg.style);
+      numbering += applyDisplayFormat(formatted, cfg.displayFormat || '{}');
+      if (cur < endLevel) numbering += (cfg.separator || '');
+    }
+    result.set(h.line, numbering);
+  }
+  return result;
+}
+
+// ============================================================
+//  从全文提取标题信息
+// ============================================================
+
+function extractHeadings(text) {
+  const lines = text.split('\n');
+  const headings = [];
+  let inCodeBlock = false;
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i];
+    if (/^```/.test(line.trim())) {
+      inCodeBlock = !inCodeBlock;
+      continue;
+    }
+    if (inCodeBlock) continue;
+    const match = line.match(/^(#{1,8})\s+(.*)$/);
+    if (match) {
+      headings.push({ level: match[1].length, text: match[2], line: i });
+    }
+  }
+  return headings;
+}
+
+// ============================================================
+//  从 Obsidian metadata cache 提取标题（用于大纲面板）
+// ============================================================
+
+function extractHeadingsFromCache(file, app) {
+  const cache = app.metadataCache.getFileCache(file);
+  if (!cache || !cache.headings) return [];
+  // cache.headings 已经按行号排序，且已过滤代码块
+  return cache.headings.map((h) => ({
+    level: h.level,
+    text: h.heading,
+    line: h.position.start.line,
+  }));
+}
+
+// ============================================================
+//  CM6 Widget — 编辑模式序号装饰
+// ============================================================
+
+class NumberWidget extends WidgetType {
+  constructor(numberStr, separator) {
+    super();
+    this.numberStr = numberStr;
+    this.separator = separator;
+  }
+  toDOM() {
+    const span = document.createElement('span');
+    span.className = 'cm-heading-number';
+    span.textContent = this.numberStr + this.separator;
+    return span;
+  }
+  ignoreEvent() { return true; }
+}
+
+function buildEditorPlugin(plugin) {
+  return ViewPlugin.fromClass(
+    class {
+      constructor(view) {
+        this.decorations = Decoration.none;
+        this.update(view);
+      }
+      update(view) {
+        if (!plugin.settings.showInEditMode) {
+          this.decorations = Decoration.none;
+          return;
+        }
+        const text = view.state.doc.toString();
+        const headings = extractHeadings(text);
+        const numberingMap = computeNumbering(headings, plugin.settings);
+        const decorations = [];
+        const sep = plugin.settings.numberSeparator || ' ';
+
+        for (const [lineNum, numberStr] of numberingMap) {
+          const line = view.state.doc.line(lineNum + 1);
+          const match = line.text.match(/^(#{1,8})\s+/);
+          if (!match) continue;
+          const insertPos = line.from + match[0].length;
+          decorations.push(
+            Decoration.widget({
+              widget: new NumberWidget(numberStr, sep),
+              side: 1,
+            }).range(insertPos)
+          );
+        }
+        this.decorations = Decoration.set(decorations, true);
+      }
+    },
+    { decorations: (v) => v.decorations }
+  );
+}
+
+// ============================================================
+//  主插件
+// ============================================================
 
 class HeadingNumbererPlugin extends Plugin {
   async onload() {
     await this.loadSettings();
-
-    // 添加命令：为当前笔记生成标题序号
-    this.addCommand({
-      id: 'heading-numberer-generate',
-      name: '生成标题序号',
-      editorCallback: (editor, view) => {
-        this.generateHeadingNumbers(editor);
-      }
-    });
-
-    // 添加命令：移除标题序号
-    this.addCommand({
-      id: 'heading-numberer-remove',
-      name: '移除标题序号',
-      editorCallback: (editor, view) => {
-        this.removeHeadingNumbers(editor);
-      }
-    });
-
-    // 添加设置面板
     this.addSettingTab(new HeadingNumbererSettingTab(this.app, this));
 
-    // 如果启用了自动生成，为每个文件的编辑器注册 modify 事件
-    this.registerEvent(
-      this.app.workspace.on('editor-change', (editor, info) => {
-        if (this.settings.autoGenerateOnChange) {
-          // 获取当前活动的文件
-          const activeFile = this.app.workspace.getActiveFile();
-          if (activeFile && activeFile.extension === 'md') {
-            // 检查修改是否发生在标题行
-            const isHeadingModified = this._isHeadingModified(editor, info);
-            
-            if (isHeadingModified) {
-              // 在下一个事件循环中执行，避免在编辑过程中频繁触发
-              if (this.autoGenerateTimeout) {
-                clearTimeout(this.autoGenerateTimeout);
-              }
-              this.autoGenerateTimeout = setTimeout(() => {
-                this.generateHeadingNumbers(editor);
-              }, 500); // 500ms 防抖延迟
-            }
+    // CM6 编辑器扩展
+    if (this.settings.showInEditMode) {
+      this.registerEditorExtension(buildEditorPlugin(this));
+    }
+
+    // 阅读模式渲染
+    this.registerMarkdownPostProcessor((el, ctx) => {
+      if (!this.settings.showInReadingMode) return;
+      const headings = el.querySelectorAll('h1, h2, h3, h4, h5, h6');
+      if (headings.length === 0) return;
+
+      const file = ctx.sourcePath ? this.app.vault.getAbstractFileByPath(ctx.sourcePath) : null;
+      if (!file) return;
+
+      // 用 metadata cache 获取标题列表（同步、快速）
+      const allHeadings = extractHeadingsFromCache(file, this.app);
+      if (allHeadings.length === 0) return;
+
+      const numberingMap = computeNumbering(allHeadings, this.settings);
+      const info = ctx.getSectionInfo(el);
+      if (!info) return;
+
+      const startLine = info.lineStart;
+      const endLine = info.lineEnd;
+      const sep = this.settings.numberSeparator || ' ';
+
+      // 遍历 section 行范围内的标题，匹配 DOM 元素
+      let headingIdx = 0;
+      for (let line = startLine; line <= endLine && headingIdx < headings.length; line++) {
+        if (numberingMap.has(line)) {
+          const h = headings[headingIdx];
+          if (h) {
+            const numberStr = numberingMap.get(line);
+            const span = document.createElement('span');
+            span.className = 'heading-number-reading';
+            span.textContent = numberStr + sep;
+            h.insertBefore(span, h.firstChild);
           }
+          headingIdx++;
         }
-      })
-    );
+        // 跳过非标题行
+        const headingOnThisLine = allHeadings.find((h) => h.line === line);
+        if (!headingOnThisLine) continue;
+      }
+    });
+
+    // 大纲面板（Outline）序号注入
+    if (this.settings.showInOutline) {
+      this.setupOutlineObserver();
+    }
+
+    this.addStylesheet();
   }
 
-  // 检查修改是否发生在标题行
-  _isHeadingModified(editor, info) {
-    try {
-      // info.changes 包含所有修改信息
-      if (!info || !info.changes || info.changes.length === 0) {
-        return false;
-      }
+  // ============================================================
+  //  大纲面板支持
+  //  Obsidian 大纲面板 DOM 结构（从 obsidian.asar 提取确认）:
+  //  .workspace-leaf-content[data-type="outline"]
+  //    └── .tree-item (每个标题项)
+  //        └── .tree-item-self
+  //            └── .tree-item-inner
+  //                └── .tree-item-inner-text (标题文本)
+  //        └── .tree-item-children (嵌套子标题)
+  //            └── .tree-item ...
+  //  注意：Obsidian 大纲面板使用通用 tree 组件，不是 .outline-item
+  // ============================================================
 
-      // 检查每一个修改，看是否涉及标题行
-      for (const change of info.changes) {
-        // change.from 和 change.to 是 {line, ch} 对象
-        const startLine = change.from.line;
-        const endLine = change.to.line;
+  setupOutlineObserver() {
+    this.outlineObserver = new MutationObserver(() => {
+      this.updateOutlinePanels();
+    });
 
-        // 检查修改影响的行范围内是否有标题行
-        for (let line = startLine; line <= endLine; line++) {
-          const lineContent = editor.getLine(line);
-          // 检查该行是否以 # 开头（标题行）
-          if (lineContent && /^#{1,8}\s/.test(lineContent)) {
-            return true;
-          }
+    this.observeOutlinePanels();
+
+    this.registerEvent(
+      this.app.workspace.on('layout-change', () => {
+        this.observeOutlinePanels();
+        this.updateOutlinePanels();
+      })
+    );
+
+    this.registerEvent(
+      this.app.workspace.on('active-leaf-change', () => {
+        setTimeout(() => {
+          this.observeOutlinePanels();
+          this.updateOutlinePanels();
+        }, 100);
+      })
+    );
+
+    this.registerEvent(
+      this.app.metadataCache.on('changed', () => {
+        setTimeout(() => this.updateOutlinePanels(), 50);
+      })
+    );
+
+    // 初始延迟一次，确保面板已渲染
+    setTimeout(() => {
+      this.observeOutlinePanels();
+      this.updateOutlinePanels();
+    }, 500);
+  }
+
+  observeOutlinePanels() {
+    const outlineLeaves = document.querySelectorAll('.workspace-leaf-content[data-type="outline"]');
+    outlineLeaves.forEach((leaf) => {
+      if (leaf.dataset.headingNumbererObserved) return;
+      leaf.dataset.headingNumbererObserved = 'true';
+
+      // 直接观察整个 leaf 内容（tree-item 会被动态创建/销毁）
+      this.outlineObserver.observe(leaf, {
+        childList: true,
+        subtree: true,
+        characterData: true,
+      });
+      console.log('[Heading Numberer] Observing outline panel:', leaf.className);
+    });
+  }
+
+  updateOutlinePanels() {
+    if (!this.settings.showInOutline) return;
+
+    const outlineLeaves = document.querySelectorAll('.workspace-leaf-content[data-type="outline"]');
+    if (outlineLeaves.length === 0) return;
+
+    outlineLeaves.forEach((leaf) => {
+      this.updateOutlinePanel(leaf);
+    });
+  }
+
+  updateOutlinePanel(leafEl) {
+    // 大纲面板用 .tree-item 结构渲染标题
+    const treeItems = leafEl.querySelectorAll('.tree-item');
+    if (treeItems.length === 0) return;
+
+    const activeFile = this.app.workspace.getActiveFile();
+    if (!activeFile || activeFile.extension !== 'md') return;
+
+    const allHeadings = extractHeadingsFromCache(activeFile, this.app);
+    if (allHeadings.length === 0) return;
+
+    const numberingMap = computeNumbering(allHeadings, this.settings);
+    const sep = this.settings.numberSeparator || ' ';
+
+    console.log('[Heading Numberer] Outline panel:', treeItems.length, 'tree items,', allHeadings.length, 'headings');
+
+    // tree-item 按文档顺序（深度优先）对应文件中的标题
+    let headingIdx = 0;
+    treeItems.forEach((item) => {
+      // 移除已有序号
+      const existing = item.querySelector('.heading-number-outline');
+      if (existing) existing.remove();
+
+      if (headingIdx < allHeadings.length) {
+        const heading = allHeadings[headingIdx];
+        const numberStr = numberingMap.get(heading.line);
+
+        if (numberStr) {
+          // 标题文本在 .tree-item-inner-text 或 .tree-item-inner
+          const titleEl = item.querySelector('.tree-item-inner-text') ||
+                          item.querySelector('.tree-item-inner') ||
+                          item;
+          const span = document.createElement('span');
+          span.className = 'heading-number-outline';
+          span.textContent = numberStr + sep;
+          titleEl.insertBefore(span, titleEl.firstChild);
         }
+        headingIdx++;
       }
+    });
+  }
 
-      return false;
-    } catch (e) {
-      console.error('检查标题行时出错:', e);
-      return false;
-    }
+  addStylesheet() {
+    const css = `
+      .cm-heading-number,
+      .heading-number-reading,
+      .heading-number-outline {
+        color: var(--text-muted);
+        font-weight: 600;
+        user-select: none;
+        opacity: 0.8;
+      }
+    `;
+    const style = document.createElement('style');
+    style.id = 'heading-numberer-styles';
+    style.textContent = css;
+    document.head.appendChild(style);
   }
 
   onunload() {
-    if (this.autoGenerateTimeout) {
-      clearTimeout(this.autoGenerateTimeout);
+    document.getElementById('heading-numberer-styles')?.remove();
+    if (this.outlineObserver) {
+      this.outlineObserver.disconnect();
     }
-    console.log('Heading Numberer 插件已卸载');
+    // 清理大纲面板中的序号
+    document.querySelectorAll('.heading-number-outline').forEach((e) => e.remove());
+    console.log('Heading Numberer (render-only) 已卸载');
   }
 
   async loadSettings() {
@@ -125,315 +462,13 @@ class HeadingNumbererPlugin extends Plugin {
   }
 
   async saveSettings() {
-    // 在保存前记录当前持久化的配置（作为 "上一次配置"），便于之后移除标题时兼容旧配置
-    try {
-      const existing = await this.loadData();
-      this.previousSettings = Object.assign({}, DEFAULT_SETTINGS, existing || {});
-    } catch (e) {
-      this.previousSettings = Object.assign({}, DEFAULT_SETTINGS);
-    }
     await this.saveData(this.settings);
   }
-
-  // 生成标题序号
-  generateHeadingNumbers(editor, preserveCursor = true) {
-    // 保存光标位置（如果需要保持光标）
-    const cursorPos = preserveCursor ? editor.getCursor() : null;
-    const scrollInfo = preserveCursor ? editor.getScrollInfo ? editor.getScrollInfo() : null : null;
-
-    const content = editor.getValue();
-    const lines = content.split('\n');
-    const counters = new Array(9).fill(0); // 支持最多 8 级标题，下标 0-8
-    const newLines = [];
-
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i];
-      const match = line.match(/^(#{1,8})\s+(.*)$/);
-
-      if (match) {
-        const hashes = match[1];
-        const level = hashes.length;
-        let title = match[2];
-
-        // 根据设置决定是否移除已有的序号
-        const cleanedTitle = this.settings.removeExisting ? this.stripNumberPrefixes(title) : title;
-
-        // 检查是否应该生成序号
-        if (level >= this.settings.startLevel && level < this.settings.startLevel + this.settings.depth) {
-          // 重置更深层级的计数器（支持到 8 级）
-          for (let j = level + 1; j <= 8; j++) {
-            counters[j] = 0;
-          }
-
-          // 增加当前级别的计数器
-          counters[level]++;
-
-          // 生成序号
-          const numbering = this.generateNumbering(level, counters);
-          const newTitle = numbering + ' ' + cleanedTitle;
-          const newLine = hashes + ' ' + newTitle;
-          newLines.push(newLine);
-        } else {
-          // 对于不在范围内的标题，仅移除序号
-          newLines.push(hashes + ' ' + cleanedTitle);
-        }
-      } else {
-        newLines.push(line);
-      }
-    }
-
-    editor.setValue(newLines.join('\n'));
-
-    // 恢复光标位置（如果需要）
-    if (preserveCursor && cursorPos) {
-      editor.setCursor(cursorPos);
-      if (scrollInfo && editor.scrollIntoView) {
-        editor.scrollIntoView(cursorPos);
-      }
-    }
-  }
-
-  // 命令使用的移除函数（调用统一的 stripNumberPrefixes）
-  removeHeadingNumbers(editor) {
-    const content = editor.getValue();
-    const cleaned = this.stripNumberPrefixes(content);
-    editor.setValue(cleaned);
-  }
-
-  // 生成序号字符串
-  generateNumbering(level, counters, tempConfigs) {
-    let numbering = '';
-    const endLevel = Math.min(level, this.settings.startLevel + this.settings.depth - 1);
-
-    // 决定编号起始段：
-    // 如果 prependParentNumber 为 false 且当前处理的标题级别大于起始级别，则跳过首级（startLevel）段
-    let firstSegment = this.settings.startLevel;
-    if (!this.settings.prependParentNumber && level > this.settings.startLevel) {
-      firstSegment = this.settings.startLevel + 1;
-    }
-
-    for (let currentLevel = firstSegment; currentLevel <= endLevel; currentLevel++) {
-      const configIndex = currentLevel - this.settings.startLevel;
-      const config = (tempConfigs && tempConfigs[configIndex]) || this.settings.levelConfigs[configIndex] || { style: '1', separator: '.' };
-      const counter = counters[currentLevel] || 0;
-
-      const formattedNumber = this.formatNumber(counter, config.style);
-      const displayFormat = config.displayFormat || '{}';
-      numbering += this.applyDisplayFormat(formattedNumber, displayFormat);
-
-      if (currentLevel < endLevel) {
-        numbering += config.separator;
-      }
-    }
-
-    return numbering;
-  }
-
-  // 格式化数字
-  formatNumber(num, style) {
-    if (num <= 0) return '';
-
-    switch (style) {
-      case '1':
-        return String(num);
-      case 'a':
-        return this.toLetters(num, false); // false 表示小写字母
-      case 'A':
-        return this.toLetters(num, true);  // true 表示大写字母
-      case 'i':
-        return this.toRoman(num).toLowerCase();
-      case 'I':
-        return this.toRoman(num);
-      case '一':
-        return this.toChineseUpper(num);
-      case '①':
-        return this.toCircledNumber(num);
-      default:
-        return String(num);
-    }
-  }
-
-  // 将数字转换为字母序列（a, b, ..., z, aa, ab, ..., az, ba, ...)
-  // 最大支持到 zzz (26 + 26^2 + 26^3 = 18278)
-  toLetters(num, isUpperCase = false) {
-    if (num <= 0) return '';
-    if (num > 18278) return String(num); // 超过 zzz 的上限则返回数字
-
-    const base = isUpperCase ? 'A'.charCodeAt(0) : 'a'.charCodeAt(0);
-    let result = '';
-    let n = num;
-
-    // 26进制递推
-    // 将数字转换为26进制：1-26 对应 a-z, 27-702 对应 aa-zz, 703-18278 对应 aaa-zzz
-    while (n > 0) {
-      n--; // 转为 0-25 范围
-      result = String.fromCharCode(base + (n % 26)) + result;
-      n = Math.floor(n / 26);
-    }
-
-    return result;
-  }
-
-  // 应用显示格式（displayFormat）到数字
-  applyDisplayFormat(number, displayFormat) {
-    if (!displayFormat || displayFormat === '{}') {
-      return number;
-    }
-    return displayFormat.replace('{}', number);
-  }
-
-  // 转换为中文大写数字（支持 0-999）
-  toChineseUpper(num) {
-    if (num <= 0 || num > 999) {
-      return String(num);
-    }
-
-    const chineseNumbers = ['零', '一', '二', '三', '四', '五', '六', '七', '八', '九'];
-    const units = ['', '十', '百', '千'];
-
-    if (num < 10) {
-      return chineseNumbers[num];
-    }
-
-    let result = '';
-    const digits = String(num).split('').map(Number);
-
-    for (let i = 0; i < digits.length; i++) {
-      const digit = digits[i];
-      const unitIndex = digits.length - 1 - i;
-
-      if (digit === 0) {
-        if (result && !result.endsWith('零')) {
-          result += '零';
-        }
-      } else {
-        result += chineseNumbers[digit];
-        if (unitIndex > 0) result += units[unitIndex];
-      }
-    }
-
-    // 处理末尾和连续的零
-    return result.replace(/零+$/, '').replace(/零+/g, '零');
-  }
-
-  // 转换为带圈阿拉伯数字（支持 1-50）
-  toCircledNumber(num) {
-    if (num > 0 && num <= 20) {
-      const circledNumbers = ['①', '②', '③', '④', '⑤', '⑥', '⑦', '⑧', '⑨', '⑩',
-        '⑪', '⑫', '⑬', '⑭', '⑮', '⑯', '⑰', '⑱', '⑲', '⑳'];
-      return circledNumbers[num - 1];
-    } else if (num > 20 && num <= 50) {
-      // 对于 21-50，使用双圈数字
-      const doubleCircledNumbers = ['㉑', '㉒', '㉓', '㉔', '㉕', '㉖', '㉗', '㉘', '㉙', '㉚',
-        '㉛', '㉜', '㉝', '㉞', '㉟', '㊱', '㊲', '㊳', '㊴', '㊵',
-        '㊶', '㊷', '㊸', '㊹', '㊺', '㊻', '㊼', '㊽', '㊾', '㊿',
-        '㊱', '㊲', '㊳', '㊴', '㊵', '㊶', '㊷', '㊸', '㊹', '㊺',
-        '㊻', '㊼', '㊽', '㊾', '㊿'];
-      return doubleCircledNumbers[num - 21];
-    }
-    return String(num);
-  }
-
-  // 转换为罗马数字
-  toRoman(num) {
-    const romanMatrix = [
-      { value: 1000, numeral: 'M' },
-      { value: 900, numeral: 'CM' },
-      { value: 500, numeral: 'D' },
-      { value: 400, numeral: 'CD' },
-      { value: 100, numeral: 'C' },
-      { value: 90, numeral: 'XC' },
-      { value: 50, numeral: 'L' },
-      { value: 40, numeral: 'XL' },
-      { value: 10, numeral: 'X' },
-      { value: 9, numeral: 'IX' },
-      { value: 5, numeral: 'V' },
-      { value: 4, numeral: 'IV' },
-      { value: 1, numeral: 'I' }
-    ];
-
-    let roman = '';
-    for (let i = 0; i < romanMatrix.length; i++) {
-      while (num >= romanMatrix[i].value) {
-        roman += romanMatrix[i].numeral;
-        num -= romanMatrix[i].value;
-      }
-    }
-    return roman;
-  }
-
-  // （已合并）旧的 removeNumberPrefix 已移除，使用 stripNumberPrefixes 统一处理
-
-  // 统一移除标题序号（支持单行或全文输入）
-  stripNumberPrefixes(input) {
-    const isText = typeof input === 'string';
-    if (!isText) return input;
-
-    const processLine = (line) => {
-      const match = line.match(/^(#{1,8})\s+(.*)$/);
-      if (!match) return line;
-      const hashes = match[1];
-      let title = match[2];
-
-      const maxLevels = Math.min(this.settings.depth, this.settings.levelConfigs.length);
-      const tokenPattern = ['\\d+', '[a-zA-Z]+', '[ivxlcdmIVXLCDM]+', '[零一二三四五六七八九十百千]+', '[\\u2460-\\u24FF\\u3200-\\u32FF\\u3300-\\u33FF]+'].join('|');
-
-      const segPatterns = [];
-      for (let i = 0; i < maxLevels; i++) {
-        const cfg = this.settings.levelConfigs[i] || { displayFormat: '{}', separator: '' };
-        segPatterns.push(this._buildSegmentPattern(cfg, tokenPattern));
-      }
-
-      if (segPatterns.length) {
-        const fullPattern = `^(?:${segPatterns.join('')})+\\s*`;
-        try {
-          title = title.replace(new RegExp(fullPattern), '').trim();
-        } catch (e) {
-          title = title.replace(/^[\d\w\(\)\[\]一二三四五六七八九十百零]+[\.\)\s\-、,，:：]*/g, '').trim();
-        }
-
-        // 最终通用回退
-        const simplePrefixRe = /^[\s]*(?:[\(\[（【]?([\u2460-\u24FF\u3200-\u32FF\u3300-\u33FF\dA-Za-z零一二三四五六七八九十百千]+)[\)\]\)）】]?)[\.\)\s\-、,，:：]*/;
-        let prev;
-        do {
-          prev = title;
-          title = title.replace(simplePrefixRe, '').trim();
-        } while (title !== prev);
-      }
-
-      return hashes + ' ' + title;
-    };
-
-    if (input.indexOf('\n') >= 0) {
-      return input.split('\n').map(processLine).join('\n');
-    } else {
-      return processLine('# ' + input).replace(/^#\s+/, '');
-    }
-  }
-
-  // 辅助方法：构建单个段的正则模式
-  _buildSegmentPattern(cfg, tokenPattern) {
-    const disp = cfg.displayFormat || '{}';
-    const escaped = disp.replace(/[-/\\^$*+?.()|[\]{}]/g, (m) => {
-      if (m === '{' || m === '}') return m;
-      return '\\' + m;
-    });
-    const seg = escaped.replace(/\{\}/g, `(${tokenPattern})`);
-
-    let sepPart = '';
-    if (Object.prototype.hasOwnProperty.call(cfg, 'separator')) {
-      if (cfg.separator === '') {
-        sepPart = '';
-      } else {
-        const sepEsc = cfg.separator.replace(/[-/\\^$*+?.()|[\]{}]/g, '\\\$&');
-        sepPart = `(?:${sepEsc})?`;
-      }
-    } else {
-      sepPart = '(?:[\\.)\\s\\-、,，:：])?';
-    }
-    return `(?:${seg})${sepPart}`;
-  }
 }
+
+// ============================================================
+//  设置面板
+// ============================================================
 
 class HeadingNumbererSettingTab extends PluginSettingTab {
   constructor(app, plugin) {
@@ -445,226 +480,198 @@ class HeadingNumbererSettingTab extends PluginSettingTab {
     const { containerEl } = this;
     containerEl.empty();
 
-    containerEl.createEl('h2', { text: '标题序号生成器设置' });
+    containerEl.createEl('h2', { text: 'Heading Numberer 设置' });
+    containerEl.createEl('p', {
+      text: '本插件仅在渲染时追加序号显示，不会修改文件内容。',
+      cls: 'setting-item-description',
+    });
 
-    // 起始级别设置
+    // --- 显示模式 ---
+    new Setting(containerEl)
+      .setName('编辑模式显示序号')
+      .setDesc('在编辑/实时预览模式中显示序号')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.showInEditMode).onChange(async (v) => {
+          this.plugin.settings.showInEditMode = v;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('阅读模式显示序号')
+      .setDesc('在阅读模式中显示序号')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.showInReadingMode).onChange(async (v) => {
+          this.plugin.settings.showInReadingMode = v;
+          await this.plugin.saveSettings();
+          this.display();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('大纲面板显示序号')
+      .setDesc('在左侧大纲（Outline）面板的标题项前显示序号')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.showInOutline).onChange(async (v) => {
+          this.plugin.settings.showInOutline = v;
+          await this.plugin.saveSettings();
+          if (v && !this.plugin.outlineObserver) {
+            this.plugin.setupOutlineObserver();
+          } else if (!v && this.plugin.outlineObserver) {
+            this.plugin.outlineObserver.disconnect();
+            document.querySelectorAll('.heading-number-outline').forEach((e) => e.remove());
+          }
+          this.plugin.updateOutlinePanels?.();
+          this.display();
+        })
+      );
+
+    new Setting(containerEl)
+      .setName('序号与标题的分隔符')
+      .setDesc('序号和标题文本之间的字符（默认空格）')
+      .addText((t) =>
+        t.setPlaceholder(' ').setValue(this.plugin.settings.numberSeparator).onChange(async (v) => {
+          this.plugin.settings.numberSeparator = v || ' ';
+          await this.plugin.saveSettings();
+          this.plugin.updateOutlinePanels?.();
+        })
+      );
+
+    // --- 编号范围 ---
     new Setting(containerEl)
       .setName('起始标题级别')
       .setDesc('从第几级标题开始生成序号（1-8）')
-      .addSlider(slider =>
-        slider
-          .setLimits(1, 8, 1)
-          .setValue(this.plugin.settings.startLevel)
-          .onChange(async value => {
-            // 在重建设置面板前保存当前页面上未保存的文本输入内容（displayFormat / separator）
-            const savedInputs = {};
-            containerEl.querySelectorAll('input[data-level][data-field]').forEach(inp => {
-              savedInputs[`${inp.dataset.level}|${inp.dataset.field}`] = inp.value;
-            });
-
-            this.plugin.settings.startLevel = value;
-            await this.plugin.saveSettings();
-            // 重建面板（因 startLevel 变化需要改变 DOM）
-            this.display();
-
-            // 重建后恢复之前保存的输入值并触发 input 事件以更新预览
-            containerEl.querySelectorAll('input[data-level][data-field]').forEach(inp => {
-              const key = `${inp.dataset.level}|${inp.dataset.field}`;
-              if (Object.prototype.hasOwnProperty.call(savedInputs, key)) {
-                inp.value = savedInputs[key];
-                inp.dispatchEvent(new Event('input', { bubbles: true }));
-              }
-            });
-          })
+      .addSlider((s) =>
+        s.setLimits(1, 8, 1).setValue(this.plugin.settings.startLevel).onChange(async (v) => {
+          this.plugin.settings.startLevel = v;
+          await this.plugin.saveSettings();
+          this.plugin.updateOutlinePanels?.();
+          this.display();
+        })
       );
 
-    // 生成深度设置
     new Setting(containerEl)
       .setName('生成深度')
       .setDesc('生成序号的层级数（1-8）')
-      .addSlider(slider =>
-        slider
-          .setLimits(1, 8, 1)
-          .setValue(this.plugin.settings.depth)
-          .onChange(async value => {
-            this.plugin.settings.depth = value;
-            // 确保 levelConfigs 有足够的项
-            while (this.plugin.settings.levelConfigs.length < value) {
-              this.plugin.settings.levelConfigs.push({ style: '1', displayFormat: '{}', separator: '' });
-            }
-            await this.plugin.saveSettings();
-            this.display(); // 刷新显示
-          })
+      .addSlider((s) =>
+        s.setLimits(1, 8, 1).setValue(this.plugin.settings.depth).onChange(async (v) => {
+          this.plugin.settings.depth = v;
+          while (this.plugin.settings.levelConfigs.length < v) {
+            this.plugin.settings.levelConfigs.push({ style: '1', displayFormat: '{}', separator: '' });
+          }
+          await this.plugin.saveSettings();
+          this.plugin.updateOutlinePanels?.();
+          this.display();
+        })
       );
 
-    // 为每一级标题添加配置
+    // --- 父级编号 ---
+    new Setting(containerEl)
+      .setName('在次级标题前添加首级序号')
+      .setDesc('勾选后显示完整路径如 1.1.a；不勾选只显示当前级如 a')
+      .addToggle((t) =>
+        t.setValue(this.plugin.settings.prependParentNumber).onChange(async (v) => {
+          this.plugin.settings.prependParentNumber = v;
+          await this.plugin.saveSettings();
+          this.plugin.updateOutlinePanels?.();
+          this._refreshPreviews(containerEl);
+        })
+      );
+
+    // --- 每级配置 ---
     containerEl.createEl('h3', { text: '每级标题的序号配置' });
 
     for (let i = 0; i < this.plugin.settings.depth; i++) {
       const levelNum = this.plugin.settings.startLevel + i;
-      const config = this.plugin.settings.levelConfigs[i] || { style: '1', separator: '' };
+      const config = this.plugin.settings.levelConfigs[i] || { style: '1', displayFormat: '{}', separator: '' };
 
-      // 创建容器
       const levelContainer = containerEl.createDiv({ cls: 'heading-level-config' });
-      levelContainer.createEl('h4', { text: `第 ${levelNum} 级标题配置` });
+      levelContainer.createEl('h4', { text: `第 ${levelNum} 级标题` });
 
-      // 创建预览容器（提前创建，便于在设置中引用）
       const preview = levelContainer.createDiv({ cls: 'heading-number-preview' });
       preview.dataset.level = String(levelNum);
 
-      // 序号样式选择
       new Setting(levelContainer)
-        .setName(`样式`)
+        .setName('样式')
         .setDesc('选择此级标题的序号样式')
-        .addDropdown(dropdown => {
-          dropdown
-            .addOptions(STYLE_OPTIONS)
-            .setValue(config.style)
-            .onChange(async value => {
-              this.plugin.settings.levelConfigs[i].style = value;
-              await this.plugin.saveSettings();
-              // 改变样式时刷新该级及所有后续级的预览（因为它们可能依赖当前级）
-              this._refreshPreviewsFrom(containerEl, i);
-            });
-        });
+        .addDropdown((d) =>
+          d.addOptions(STYLE_OPTIONS).setValue(config.style).onChange(async (v) => {
+            this.plugin.settings.levelConfigs[i].style = v;
+            await this.plugin.saveSettings();
+            this.plugin.updateOutlinePanels?.();
+            this._refreshPreviewsFrom(containerEl, i);
+          })
+        );
 
-      // 显示格式设置
       new Setting(levelContainer)
-        .setName(`显示格式`)
-        .setDesc('使用 {} 作为序号的占位符。例如：({}) 可生成 (1)、(2)、(3)；【{}】 可生成 【1】、【2】、【3】')
-        .addText(text => {
-          text
-            .setPlaceholder('{}')
-            .setValue(config.displayFormat || '{}')
-            .onChange(async value => {
-              this.plugin.settings.levelConfigs[i].displayFormat = value || '{}';
-              await this.plugin.saveSettings();
-              // 刷新该级及后续级预览
-              this._refreshPreviewsFrom(containerEl, i);
-            });
-
-          // 实时预览（按键时）: 不保存，只用临时配置更新预览
-          text.inputEl.dataset.level = String(levelNum);
-          text.inputEl.dataset.field = 'displayFormat';
-          text.inputEl.addEventListener('input', (e) => {
-            const v = e.target.value || '{}';
-            const tempCfg = Object.assign({}, config, { displayFormat: v });
-            const overrides = {};
-            overrides[i] = tempCfg;
-            this.updatePreview(preview, levelNum, overrides);
+        .setName('显示格式')
+        .setDesc('使用 {} 作为占位符。如 ({}) 生成 (1)、(2)')
+        .addText((t) => {
+          t.setPlaceholder('{}').setValue(config.displayFormat || '{}').onChange(async (v) => {
+            this.plugin.settings.levelConfigs[i].displayFormat = v || '{}';
+            await this.plugin.saveSettings();
+            this.plugin.updateOutlinePanels?.();
+            this._refreshPreviewsFrom(containerEl, i);
+          });
+          t.inputEl.addEventListener('input', () => {
+            const v = t.inputEl.value || '{}';
+            this._updatePreview(preview, levelNum, { [i]: { ...config, displayFormat: v } });
           });
         });
 
-      // 分隔符设置
       new Setting(levelContainer)
-        .setName(`分隔符`)
-        .setDesc('此级序号与下一级序号的分隔符')
-        .addText(text => {
-          text
-            .setPlaceholder('(空)')
-            .setValue(config.separator)
-            .onChange(async value => {
-              this.plugin.settings.levelConfigs[i].separator = value === undefined ? '' : value;
-              await this.plugin.saveSettings();
-              // 刷新该级及后续级预览
-              this._refreshPreviewsFrom(containerEl, i);
-            });
-
-          // 实时预览（按键时）: 不保存，只用临时配置更新预览
-          text.inputEl.dataset.level = String(levelNum);
-          text.inputEl.dataset.field = 'separator';
-          text.inputEl.addEventListener('input', (e) => {
-            const v = e.target.value === undefined ? '' : e.target.value;
-            const tempCfg = Object.assign({}, config, { separator: v });
-            const overrides = {};
-            overrides[i] = tempCfg;
-            this.updatePreview(preview, levelNum, overrides);
+        .setName('分隔符')
+        .setDesc('此级与下一级的分隔符')
+        .addText((t) => {
+          t.setPlaceholder('(空)').setValue(config.separator).onChange(async (v) => {
+            this.plugin.settings.levelConfigs[i].separator = v ?? '';
+            await this.plugin.saveSettings();
+            this.plugin.updateOutlinePanels?.();
+            this._refreshPreviewsFrom(containerEl, i);
+          });
+          t.inputEl.addEventListener('input', () => {
+            const v = t.inputEl.value ?? '';
+            this._updatePreview(preview, levelNum, { [i]: { ...config, separator: v } });
           });
         });
 
-      // 效果预览（已在上面提前创建）
-      this.updatePreview(preview, levelNum);
+      this._updatePreview(preview, levelNum);
     }
-
-    // 移除已有序号选项
-    containerEl.createEl('hr');
-    // 是否在次级标题前添加首级序号
-    new Setting(containerEl)
-      .setName('在次级标题前添加首级序号')
-      .setDesc('如果勾选，则在次级/更深级标题前加入首级的序号前缀。例如：首级为 “一、”，次级会显示为 “一、1”；未勾选则只显示次级自身的序号如 “1”')
-      .addToggle(toggle =>
-        toggle
-          .setValue(this.plugin.settings.prependParentNumber)
-          .onChange(async value => {
-            this.plugin.settings.prependParentNumber = value;
-            await this.plugin.saveSettings();
-            // 仅刷新所有已渲染的预览，而不重建 DOM，避免改变焦点或破坏撤销栈
-            const previews = containerEl.querySelectorAll('.heading-number-preview');
-            previews.forEach(p => {
-              const lvl = Number(p.dataset.level);
-              if (!isNaN(lvl)) this.updatePreview(p, lvl);
-            });
-          })
-      );
-    new Setting(containerEl)
-      .setName('自动移除已有序号')
-      .setDesc('生成新序号时，自动移除标题中已有的序号')
-      .addToggle(toggle =>
-        toggle
-          .setValue(this.plugin.settings.removeExisting)
-          .onChange(async value => {
-            this.plugin.settings.removeExisting = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName('自动生成序号')
-      .setDesc('当标题内容改变时，自动重新生成序号')
-      .addToggle(toggle =>
-        toggle
-          .setValue(this.plugin.settings.autoGenerateOnChange)
-          .onChange(async value => {
-            this.plugin.settings.autoGenerateOnChange = value;
-            await this.plugin.saveSettings();
-          })
-      );
-
-    // 帮助信息
-    containerEl.createEl('h3', { text: '使用说明' });
-    const helpText = containerEl.createEl('div', { cls: 'heading-help-text' });
-    helpText.createEl('p', { text: '1. 打开要处理的笔记文件' });
-    helpText.createEl('p', { text: '2. 使用命令面板（Ctrl+P）输入"生成标题序号"来为标题添加序号' });
-    helpText.createEl('p', { text: '3. 使用"移除标题序号"命令来移除序号' });
-
   }
 
-  // 更新某一级的预览：展示从 startLevel 到该级的实际编号效果（用若干示例数字）
-  updatePreview(container, level, tempConfigs) {
+  _updatePreview(container, level, overrides) {
     container.innerHTML = '';
     const examples = [1, 2, 3];
-    const parts = examples.map(num => {
+    const parts = examples.map((num) => {
       const counters = new Array(9).fill(0);
       const start = this.plugin.settings.startLevel;
-      // 优化：所有层级都使用相同的示例数字，使预览更直观（例如 1.1、2.2、3.3）
-      for (let l = start; l <= level; l++) {
-        counters[l] = num;
+      for (let l = start; l <= level; l++) counters[l] = num;
+      const oldConfigs = this.plugin.settings.levelConfigs;
+      const tempSettings = { ...this.plugin.settings };
+      if (overrides) {
+        tempSettings.levelConfigs = oldConfigs.map((c, idx) => overrides[idx] ? { ...c, ...overrides[idx] } : c);
       }
-      return this.plugin.generateNumbering(level, counters, tempConfigs);
+      return computeNumbering(
+        [{ level, text: '', line: 0 }],
+        { ...tempSettings, startLevel: start, depth: level - start + 1 }
+      ).get(0) || '';
     });
-
-    const text = parts.length ? `效果预览: ${parts.join('   ')}...` : '效果预览: -';
-    container.createEl('small', { text });
+    container.createEl('small', { text: `预览: ${parts.join('   ')}...` });
   }
 
-  // 辅助方法：从指定 configIndex 开始刷新所有后续级的预览（因为它们依赖该级配置）
+  _refreshPreviews(containerEl) {
+    containerEl.querySelectorAll('.heading-number-preview').forEach((p) => {
+      const lvl = Number(p.dataset.level);
+      if (!isNaN(lvl)) this._updatePreview(p, lvl);
+    });
+  }
+
   _refreshPreviewsFrom(containerEl, startIndex) {
     for (let i = startIndex; i < this.plugin.settings.depth; i++) {
       const levelNum = this.plugin.settings.startLevel + i;
       const preview = containerEl.querySelector(`[data-level="${levelNum}"]`);
-      if (preview) {
-        this.updatePreview(preview, levelNum);
-      }
+      if (preview) this._updatePreview(preview, levelNum);
     }
   }
 }
